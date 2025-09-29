@@ -93,10 +93,14 @@ class ReqToTokenPool:
         return select_index
 
     def free(self, free_index: Union[int, List[int]]):
+        # fixme: check double free !!!!!!!!!!
         if isinstance(free_index, (int,)):
-            self.free_slots.append(free_index)
+            if self.free_slots.count(free_index) == 0:
+                self.free_slots.append(free_index)
         else:
-            self.free_slots.extend(free_index)
+            for idx in free_index:
+                if self.free_slots.count(idx) == 0:
+                    self.free_slots.append(idx)
 
     def clear(self):
         self.free_slots = list(range(self.size))

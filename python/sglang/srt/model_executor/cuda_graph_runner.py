@@ -166,6 +166,8 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     server_args = model_runner.server_args
     capture_bs = server_args.cuda_graph_bs
 
+    capture_bs = [1] # XXX: hardcode capture bs to 1 for now
+
     if capture_bs is None:
         if server_args.speculative_algorithm is None:
             if server_args.disable_cuda_graph_padding:
@@ -265,6 +267,8 @@ class CudaGraphRunner:
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
 
+        self.is_diffusion = (model_runner.server_args.diffusion_algorithm is not None)
+
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
         log_info_on_rank0(logger, f"Capture cuda graph bs {self.capture_bs}")
@@ -283,6 +287,10 @@ class CudaGraphRunner:
                     self.model_runner.server_args.speculative_num_draft_tokens
                 )
 
+        if self.is_diffusion:
+            self.capture_forward_mode = ForwardMode.EXTEND
+            self.num_tokens_per_bs = model_runner.server_args.diffusion_block_size
+
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
         if model_runner.server_args.enable_return_hidden_states:
             self.capture_hidden_mode = CaptureHiddenMode.FULL
@@ -296,6 +304,8 @@ class CudaGraphRunner:
         self.seq_len_fill_value = (
             self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
         )
+        if self.is_diffusion:
+            self.seq_len_fill_value = model_runner.server_args.diffusion_block_size
 
         # FIXME(lsyin): leave it here for now, I don't know whether it is necessary
         self.encoder_len_fill_value = 0
@@ -315,6 +325,9 @@ class CudaGraphRunner:
             self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
             self.seq_lens = torch.full(
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
+            )
+            self.prefix_lens = torch.full(
+                (self.max_bs,), 0, dtype=torch.int32
             )
             self.out_cache_loc = torch.zeros(
                 (self.max_num_token,), dtype=self._cache_loc_dtype()
@@ -531,6 +544,7 @@ class CudaGraphRunner:
         input_ids = self.input_ids[:num_tokens]
         req_pool_indices = self.req_pool_indices[:bs]
         seq_lens = self.seq_lens[:bs]
+        prefix_lens = self.prefix_lens[:bs]
         out_cache_loc = self.out_cache_loc[:num_tokens]
         positions = self.positions[:num_tokens]
         if self.is_encoder_decoder:
@@ -601,6 +615,7 @@ class CudaGraphRunner:
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
+            extend_seq_lens=seq_lens.clone(),
             next_token_logits_buffer=next_token_logits_buffer,
             orig_seq_lens=seq_lens,
             req_to_token_pool=self.model_runner.req_to_token_pool,
@@ -637,6 +652,7 @@ class CudaGraphRunner:
             encoder_lens,
             forward_batch.forward_mode,
             forward_batch.spec_info,
+            prefix_lens,
         )
 
         # Run and capture
@@ -741,6 +757,10 @@ class CudaGraphRunner:
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
         self.positions[:raw_num_token].copy_(forward_batch.positions)
 
+        if self.is_diffusion:
+            self.prefix_lens[:raw_bs].copy_(self.seq_lens[:raw_bs])
+            self.prefix_lens[:raw_bs] -= self.num_tokens_per_bs
+
         seq_lens_cpu = None
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
@@ -791,6 +811,7 @@ class CudaGraphRunner:
             self.capture_forward_mode,
             forward_batch.spec_info,
             seq_lens_cpu=seq_lens_cpu,
+            prefix_lens=self.prefix_lens[:bs],
         )
 
         # Store fields
@@ -818,6 +839,7 @@ class CudaGraphRunner:
         if isinstance(output, LogitsProcessorOutput):
             return LogitsProcessorOutput(
                 next_token_logits=output.next_token_logits[: self.raw_num_token],
+                full_logits=output.full_logits[: self.raw_num_token],
                 hidden_states=(
                     output.hidden_states[: self.raw_num_token]
                     if output.hidden_states is not None

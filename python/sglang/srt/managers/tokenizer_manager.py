@@ -217,6 +217,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     revision=server_args.revision,
                 )
 
+        self.diffusion_block_size = server_args.diffusion_block_size
+
         # Init inter-process communication
         context = zmq.asyncio.Context(2)
         self.recv_from_detokenizer = get_zmq_socket(
@@ -409,6 +411,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 input_ids = encoded["input_ids"][0]
                 token_type_ids = encoded.get("token_type_ids", [None])[0]
 
+        assert isinstance(obj, GenerateReqInput)
+        max_tokens = (len(input_ids) + obj.sampling_params['max_new_tokens'] +
+                        self.diffusion_block_size - 1) & ~(self.diffusion_block_size - 1)
+        input_ids += [156895 for i in range(max_tokens - len(input_ids))]
+
         if self.mm_processor and obj.contains_mm_input():
             if not isinstance(obj.image_data, list):
                 obj.image_data = [obj.image_data]
@@ -589,6 +596,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         # Process all requests
         tokenized_objs = []
         for i, req in enumerate(requests):
+            assert isinstance(req, GenerateReqInput)
+            max_tokens = (len(input_ids_list[i]) + req.sampling_params['max_new_tokens'] +
+                            self.diffusion_block_size - 1) & ~(self.diffusion_block_size - 1)
+            input_ids_list[i] += [156895 for i in range(max_tokens - len(input_ids_list[i]))]
+
             self._validate_one_request(obj[i], input_ids_list[i])
             tokenized_objs.append(
                 self._create_tokenized_object(

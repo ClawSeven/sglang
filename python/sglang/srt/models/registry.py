@@ -101,6 +101,24 @@ def import_model_classes():
                     ), f"Duplicated model implementation for {entry.__name__}"
                     model_arch_name_to_cls[entry.__name__] = entry
 
+
+    # Add DLLM v2 OLMoE model registrations
+    try:
+        from sglang.srt.models.llada_moe import OlmoeDllmForCausalLM
+        from sglang.srt.models.bailing_moe import BailingMoeForCausalLM
+        from sglang.srt.models.bailing_moe import BailingMoeV2ForCausalLM
+
+
+        model_arch_name_to_cls.update({
+            "OlmoeForCausalLM": OlmoeDllmForCausalLM,
+            "LLaDAMoEModel": OlmoeDllmForCausalLM,
+            "olmoe": OlmoeDllmForCausalLM,
+            "dllm": OlmoeDllmForCausalLM,
+            "LLaDA2MoeModelLM": BailingMoeV2ForCausalLM,
+        })
+    except ImportError as e:
+        logger.warning(f"Failed to import DLLM v2 OLMoE models: {e}")
+
     return model_arch_name_to_cls
 
 

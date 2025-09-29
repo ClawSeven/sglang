@@ -193,6 +193,60 @@ class SchedulerOutputProcessorMixin:
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
+    def process_batch_result_diffusion(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+        launch_done: Optional[threading.Event] = None,
+    ):
+        logits_output, next_token_ids, start_list, can_run_cuda_graph = (
+            result.logits_output,
+            result.next_token_ids,
+            result.start_list,
+            result.can_run_cuda_graph,
+        )
+        self.num_generated_tokens += len(batch.reqs)
+
+        next_token_ids = next_token_ids.tolist()
+
+        self.token_to_kv_pool_allocator.free_group_begin()
+
+        for i, (req, next_token_ids) in enumerate(zip(batch.reqs, next_token_ids)):
+            if start_list is not None:
+                start = start_list[i]
+                next_token_ids = next_token_ids[start:]
+
+            for next_token_id in next_token_ids:
+                req.output_ids.append(next_token_id)
+                req.check_finished()
+                if req.finished():
+                    self.tree_cache.cache_finished_req(req)
+                    req.time_stats.completion_time = time.time()
+
+                if req.grammar is not None:
+                    # FIXME: this try-except block is for handling unexpected xgrammar issue.
+                    try:
+                        req.grammar.accept_token(next_token_id)
+                    except ValueError as e:
+                        # Grammar accept_token can raise ValueError if the token is not in the grammar.
+                        # This can happen if the grammar is not set correctly or the token is invalid.
+                        logger.error(
+                            f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                        )
+                        self.abort_request(AbortReq(req.rid))
+                    req.grammar.finished = req.finished()
+
+        self.set_next_batch_sampling_info_done(batch)
+        self.stream_output(batch.reqs, batch.return_logprob)
+        self.token_to_kv_pool_allocator.free_group_end()
+
+        self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
+        if (
+            self.current_scheduler_metrics_enabled()
+            and self.forward_ct_decode % self.server_args.decode_log_interval == 0
+        ):
+            self.log_decode_stats(can_run_cuda_graph, running_batch=batch)
+
     def process_batch_result_decode(
         self: Scheduler,
         batch: ScheduleBatch,

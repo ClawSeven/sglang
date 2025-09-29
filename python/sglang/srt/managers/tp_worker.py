@@ -19,6 +19,8 @@ import threading
 from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
+import numpy as np
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_pp_group, get_world_group
@@ -38,6 +40,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
+from sglang.srt.diffusion.algorithm import get_algorithm
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -45,6 +48,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
+from typing import List
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -89,6 +93,12 @@ class TpModelWorker:
             ),
             is_draft_model=is_draft_worker,
         )
+
+        self.diffusion_algorithm = get_algorithm(
+            server_args.diffusion_algorithm,
+            server_args.diffusion_block_size)
+
+        self.diffusion_block_size = server_args.diffusion_block_size
 
         self.model_runner = ModelRunner(
             model_config=self.model_config,
@@ -232,12 +242,13 @@ class TpModelWorker:
         launch_done: Optional[threading.Event] = None,
         skip_sample: bool = False,
     ) -> Tuple[
-        Union[LogitsProcessorOutput, torch.Tensor], Optional[torch.Tensor], bool
+        Union[LogitsProcessorOutput, torch.Tensor], Optional[torch.Tensor], Optional[List[int]], bool
     ]:
         # update the consumer index of hicache to the running batch
         self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
 
-        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner,
+                                              self.diffusion_algorithm is not None)
 
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
@@ -248,6 +259,9 @@ class TpModelWorker:
             )
 
         if self.pp_group.is_last_rank:
+            if self.diffusion_algorithm is not None:
+                return self.diffusion_algorithm.run(self.model_runner, forward_batch)
+
             logits_output, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch, pp_proxy_tensors=pp_proxy_tensors
             )
@@ -261,13 +275,13 @@ class TpModelWorker:
                     logits_output, model_worker_batch
                 )
 
-            return logits_output, next_token_ids, can_run_cuda_graph
+            return logits_output, next_token_ids, None, can_run_cuda_graph
         else:
             pp_proxy_tensors, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
-            return pp_proxy_tensors.tensors, None, can_run_cuda_graph
+            return pp_proxy_tensors.tensors, None, None, can_run_cuda_graph
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)

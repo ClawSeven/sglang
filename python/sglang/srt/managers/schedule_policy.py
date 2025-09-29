@@ -279,6 +279,8 @@ class PrefillAdder:
         rem_input_tokens: int,
         rem_chunk_tokens: Optional[int],
         mixed_with_decode_tokens: int = 0,
+        diffusion_block_size: int = 32,
+        diffusion_rem_tokens: int = 64,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -287,6 +289,13 @@ class PrefillAdder:
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - mixed_with_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
+
+        self.diffusion_block_size = diffusion_block_size
+        self.diffusion_rem_tokens = diffusion_rem_tokens
+
+        # fixme: hard code here 
+        self.is_diffusion_mode = True
+
         if self.rem_chunk_tokens is not None:
             self.rem_chunk_tokens -= mixed_with_decode_tokens
 
@@ -295,7 +304,7 @@ class PrefillAdder:
 
         self.req_states = None
         self.can_run_list = []
-        self.new_chunked_req = None
+        self.new_chunked_reqs = []
         self.log_hit_tokens = 0
         # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
@@ -357,10 +366,14 @@ class PrefillAdder:
         if self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0:
             return AddReqResult.NO_TOKEN
 
-        if self.rem_input_tokens <= 0 or (
-            self.rem_chunk_tokens is not None and self.rem_chunk_tokens <= 0
-        ):
-            return AddReqResult.OTHER
+        if self.is_diffusion_mode:
+            if self.diffusion_rem_tokens is not None and self.diffusion_rem_tokens <= 0:
+                return AddReqResult.OTHER
+        else:
+            if self.rem_input_tokens <= 0 or (
+                self.rem_chunk_tokens is not None and self.rem_chunk_tokens <= 0
+            ):
+                return AddReqResult.OTHER
 
         return AddReqResult.CONTINUE
 
@@ -375,12 +388,16 @@ class PrefillAdder:
         self.rem_input_tokens -= extend_input_len
         if self.rem_chunk_tokens is not None:
             self.rem_chunk_tokens -= extend_input_len
+        
+        if self.diffusion_rem_tokens is not None and self.is_diffusion_mode:
+            self.diffusion_rem_tokens -= extend_input_len
 
         self.log_hit_tokens += prefix_len
         self.log_input_tokens += extend_input_len
 
     def add_chunked_req(self, req: Req):
-        _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
+        _rem_tokens = min(self.diffusion_rem_tokens, self.diffusion_block_size, int(self.rem_total_tokens))
+
         truncated = req.extend_input_len > _rem_tokens
         req.extend_input_len = min(req.extend_input_len, _rem_tokens)
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
@@ -490,12 +507,13 @@ class PrefillAdder:
             req.extend_input_len = trunc_len
             req.fill_ids = req.fill_ids[:trunc_len]
             self.can_run_list.append(req)
-            self.new_chunked_req = req
+            self.new_chunked_reqs.append(req)
             self._update_prefill_budget(0, trunc_len, 0)
 
         return self.budget_state()
 
     def add_one_req(self, req: Req, has_chunked_req: bool):
+        # fixme: consider this branch in diffusion mode
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req, has_chunked_req)
 
@@ -550,7 +568,10 @@ class PrefillAdder:
                 )
             else:
                 # Make sure at least one page is available
-                trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
+                if self.is_diffusion_mode:
+                    trunc_len = min(self.diffusion_rem_tokens, self.diffusion_block_size) // self.page_size * self.page_size
+                else:
+                    trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
                 if trunc_len <= 0:
                     return AddReqResult.OTHER
 
@@ -559,7 +580,7 @@ class PrefillAdder:
                 req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
 
                 self.can_run_list.append(req)
-                self.new_chunked_req = req
+                self.new_chunked_reqs.append(req)
                 if self.is_hybrid:
                     swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
                     req.swa_uuid_for_lock = swa_uuid_for_lock
@@ -567,4 +588,5 @@ class PrefillAdder:
                     self.tree_cache.inc_lock_ref(req.last_node)
                 self._update_prefill_budget(prefix_len, trunc_len, 0)
 
-        return self.budget_state()
+        status = self.budget_state()
+        return status

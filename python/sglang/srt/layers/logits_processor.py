@@ -82,6 +82,8 @@ class LogitsProcessorOutput:
     input_token_ids_logprobs_val: Optional[List] = None
     input_token_ids_logprobs_idx: Optional[List] = None
 
+    ## Part 4: Diffusion-only.
+    full_logits: Optional[torch.Tensor] = None
 
 @dataclasses.dataclass
 class LogitsMetadata:
@@ -338,6 +340,8 @@ class LogitsProcessor(nn.Module):
             full_logits = self._get_logits(hidden_states, lm_head, logits_metadata)
             dump_to_file(self.debug_tensor_dump_output_folder, "logits", full_logits)
 
+        full_logits = self._get_logits(hidden_states, lm_head, logits_metadata)
+
         hidden_states_to_store: Optional[torch.Tensor] = None
         if logits_metadata.capture_hidden_mode.need_capture():
             if logits_metadata.capture_hidden_mode.is_full():
@@ -368,6 +372,7 @@ class LogitsProcessor(nn.Module):
         if not logits_metadata.extend_return_logprob:
             # Decode mode or extend mode without return_logprob.
             return LogitsProcessorOutput(
+                full_logits=full_logits,
                 next_token_logits=sampled_logits,
                 hidden_states=hidden_states_to_store,
             )
@@ -418,6 +423,7 @@ class LogitsProcessor(nn.Module):
             ]
 
             return LogitsProcessorOutput(
+                full_logits=full_logits,
                 next_token_logits=sampled_logits,
                 input_token_logprobs=input_token_logprobs,
                 input_top_logprobs_val=input_top_logprobs_val,
@@ -608,6 +614,27 @@ class LogitsProcessor(nn.Module):
             return torch.log(probs)
         else:
             return torch.nn.functional.log_softmax(last_logits, dim=-1)
+
+    def get_full_logits(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+    ) -> torch.Tensor:
+        """
+        Get full logits from all hidden states without any pruning or sampling.
+
+        Args:
+            hidden_states: All hidden states from the model
+            lm_head: Language model head for projecting hidden states to logits
+            logits_metadata: Metadata for logits processing
+
+        Returns:
+            torch.Tensor: Full logits with shape [batch_size, seq_len, vocab_size]
+        """
+        # Compute logits for all hidden states
+        full_logits = self._get_logits(hidden_states, lm_head, logits_metadata)
+        return full_logits
 
 
 @triton.jit

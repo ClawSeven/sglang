@@ -147,6 +147,10 @@ class ServerArgs:
     revision: Optional[str] = None
     model_impl: str = "auto"
 
+    # Diffusion
+    diffusion_algorithm: Optional[str] = None
+    diffusion_block_size: Optional[int] = None
+
     # HTTP server
     host: str = "127.0.0.1"
     port: int = 30000
@@ -709,6 +713,9 @@ class ServerArgs:
                 "Pipeline parallelism is incompatible with overlap schedule."
             )
 
+        # XXX: disable overlap for now
+        self.disable_overlap_schedule = True
+
         # Hicache
         if self.hicache_storage_backend == "mooncake":
             # to use mooncake storage backend, the following conditions must be met:
@@ -964,6 +971,20 @@ class ServerArgs:
             '* "sglang" will use the SGLang model implementation.\n'
             '* "transformers" will use the Transformers model '
             "implementation.\n",
+        )
+
+        # Diffusion
+        parser.add_argument(
+            "--diffusion-algorithm",
+            type=str,
+            default=ServerArgs.diffusion_algorithm,
+            help="The diffusion algorithm."
+        )
+        parser.add_argument(
+            "--diffusion-block-size",
+            type=int,
+            default=ServerArgs.diffusion_block_size,
+            help="The number of tokens processed in each iteration of the block diffusion model."
         )
 
         # HTTP server

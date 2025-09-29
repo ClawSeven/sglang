@@ -89,6 +89,9 @@ class ForwardMode(IntEnum):
     # Split Prefill for PD multiplexing
     SPLIT_PREFILL = auto()
 
+    def is_diffusion(self):
+        return True  # XXX: hardcode for now
+
     def is_prefill(self):
         return self.is_extend()
 
@@ -130,6 +133,7 @@ class ForwardMode(IntEnum):
             self == ForwardMode.DECODE
             or self == ForwardMode.TARGET_VERIFY
             or self == ForwardMode.IDLE
+            or (self == ForwardMode.EXTEND and self.is_diffusion())
         )
 
     def is_cpu_graph(self):
@@ -314,8 +318,101 @@ class ForwardBatch:
         cls,
         batch: ModelWorkerBatch,
         model_runner: ModelRunner,
+        diffusion: Optional[bool],
     ):
         from sglang.srt.two_batch_overlap import TboForwardBatchPreparer
+
+        if diffusion is True:
+            ret = cls(
+                forward_mode=batch.forward_mode,
+                batch_size=len(batch.seq_lens),
+                input_ids=batch.input_ids,
+                req_pool_indices=batch.req_pool_indices,
+                seq_lens=batch.seq_lens,
+                out_cache_loc=batch.out_cache_loc,
+                mm_inputs=batch.multimodal_inputs,
+                encoder_cached=batch.encoder_cached,
+                encoder_lens=batch.encoder_lens,
+                encoder_lens_cpu=batch.encoder_lens_cpu,
+                encoder_out_cache_loc=batch.encoder_out_cache_loc,
+                seq_lens_sum=batch.seq_lens_sum,
+                seq_lens_cpu=batch.seq_lens_cpu,
+                orig_seq_lens=batch.orig_seq_lens,
+                return_logprob=batch.return_logprob,
+                top_logprobs_nums=batch.top_logprobs_nums,
+                token_ids_logprobs=batch.token_ids_logprobs,
+                is_extend_in_batch=batch.is_extend_in_batch,
+                can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
+                global_forward_mode=batch.global_forward_mode,
+                lora_ids=batch.lora_ids,
+                sampling_info=batch.sampling_info,
+                req_to_token_pool=model_runner.req_to_token_pool,
+                token_to_kv_pool=model_runner.token_to_kv_pool,
+                attn_backend=model_runner.attn_backend,
+                spec_algorithm=batch.spec_algorithm,
+                spec_info=batch.spec_info,
+                capture_hidden_mode=batch.capture_hidden_mode,
+                input_embeds=batch.input_embeds,
+                token_type_ids=batch.token_type_ids,
+                tbo_split_seq_index=batch.tbo_split_seq_index,
+            )
+            device = model_runner.device
+
+            # Idle mode
+            if ret.forward_mode.is_idle():
+                ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
+                TboForwardBatchPreparer.prepare(
+                    ret, is_draft_worker=model_runner.is_draft_worker
+                )
+                return ret
+
+            # Extend mode
+            # Init position information
+            ret.extend_seq_lens = torch.tensor(
+                batch.extend_seq_lens, dtype=torch.int32
+            ).to(device, non_blocking=True)
+            ret.extend_prefix_lens = torch.tensor(
+                batch.extend_prefix_lens, dtype=torch.int32
+            ).to(device, non_blocking=True)
+            ret.extend_num_tokens = batch.extend_num_tokens
+            positions, ret.extend_start_loc = compute_position(
+                model_runner.server_args.attention_backend,
+                ret.extend_prefix_lens,
+                ret.extend_seq_lens,
+                ret.extend_num_tokens,
+            )
+            ret.extend_prefix_lens_cpu = batch.extend_prefix_lens
+            ret.extend_seq_lens_cpu = batch.extend_seq_lens
+            ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens
+
+            if ret.positions is None:
+                total_positions = len(batch.diffusion_block_start) * batch.diffusion_block_size
+                positions_buffer = torch.empty(total_positions, dtype=torch.int32, device=device)
+    
+                start_tensor = torch.tensor(batch.diffusion_block_start, device=device)
+                block_range = torch.arange(batch.diffusion_block_size, device=device)
+    
+                for i, start in enumerate(start_tensor):
+                    start_idx = i * batch.diffusion_block_size
+                    end_idx = start_idx + batch.diffusion_block_size
+                    positions_buffer[start_idx:end_idx] = start + block_range
+    
+                ret.positions = positions_buffer
+
+            if model_runner.model_is_mrope:
+                if (
+                    ret.spec_info is not None
+                    and getattr(ret.spec_info, "positions", None) is not None
+                ):
+                    ret._compute_spec_mrope_positions(model_runner, batch)
+                else:
+                    ret._compute_mrope_positions(model_runner, batch)
+
+            TboForwardBatchPreparer.prepare(
+                ret, is_draft_worker=model_runner.is_draft_worker
+            )
+
+            return ret
 
         ret = cls(
             forward_mode=batch.forward_mode,

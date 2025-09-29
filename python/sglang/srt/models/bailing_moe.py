@@ -61,7 +61,7 @@ from sglang.srt.layers.moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -467,7 +467,9 @@ class BailingMoEAttention(nn.Module):
 
         self.scale = self.head_dim**-0.5
 
-        self.use_qk_norm = getattr(config, "use_qk_norm", False)
+        # self.use_qk_norm = getattr(config, "use_qk_norm", False)
+        # Fixme: The llada2 model uses qk norm by default but no use_qk_norm config field
+        self.use_qk_norm = getattr(config, "use_qk_norm", True)
 
         self.query_key_value = QKVParallelLinear(
             self.hidden_size,
@@ -516,6 +518,7 @@ class BailingMoEAttention(nn.Module):
             self.scale,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            attn_type=AttentionType.ENCODER_ONLY,
             prefix=add_prefix("attn", prefix),
         )
 
@@ -548,6 +551,7 @@ class BailingMoEAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
@@ -556,7 +560,7 @@ class BailingMoEAttention(nn.Module):
         if self.use_qk_norm:
             q, k = self._apply_qk_norm(q, k)
         q, k = self.rotary_emb(positions, q, k)
-        context_layer = self.attn(q, k, v, forward_batch)
+        context_layer = self.attn(q, k, v, forward_batch, save_kv_cache)
         attn_output, _ = self.dense(context_layer)
         return attn_output
 
@@ -647,6 +651,7 @@ class BailingMoEBlock(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        save_kv_cache: bool = True,
     ) -> torch.Tensor:
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states=hidden_states,
@@ -658,6 +663,7 @@ class BailingMoEBlock(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
+            save_kv_cache=save_kv_cache,
         )
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
@@ -734,6 +740,7 @@ class BailingMoEModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        save_kv_cache: bool = True,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         if self.pp_group.is_first_rank:
             if input_embeds is None:
@@ -754,6 +761,7 @@ class BailingMoEModel(nn.Module):
                     hidden_states,
                     forward_batch,
                     residual,
+                    save_kv_cache,
                 )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
@@ -834,6 +842,7 @@ class BailingMoEForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        save_kv_cache: bool = True,
     ) -> torch.Tensor:
         hidden_states = self.model(
             input_ids,
@@ -841,6 +850,7 @@ class BailingMoEForCausalLM(nn.Module):
             forward_batch,
             input_embeds,
             pp_proxy_tensors=pp_proxy_tensors,
+            save_kv_cache=save_kv_cache,
         )
         if self.pp_group.is_last_rank:
             return self.logits_processor(

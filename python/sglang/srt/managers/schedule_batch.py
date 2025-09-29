@@ -434,7 +434,12 @@ class Req:
         bootstrap_room: Optional[int] = None,
         data_parallel_rank: Optional[int] = None,
         vocab_size: Optional[int] = None,
+        diffusion_params: Optional[Dict[str, Any]] = None,
     ):
+        # block diffusion params
+        self.block_size: int = diffusion_params.get("block_size", 32) if diffusion_params else 0
+        self.block_start:int = 0
+
         # Input and output info
         self.rid = rid
         self.origin_input_text = origin_input_text
@@ -518,6 +523,10 @@ class Req:
         # it is chunked, and decrement whenever chunked request is
         # processed.
         self.is_chunked = 0
+
+        # hard code
+        self.is_block_diffusion = diffusion_params is not None
+        self.block_count = 0
 
         # For retraction
         self.is_retracted = False
@@ -629,10 +638,18 @@ class Req:
         # Whether request reached finished condition
         return self.finished_reason is not None
 
+    # for block diffusion
+    def update_diffusion_params(self):
+        self.block_count += 1
+        self.block_start = self.block_size * (self.block_count - 1)
+
     def init_next_round_input(
         self,
         tree_cache: Optional[BasePrefixCache] = None,
     ):
+        if self.is_block_diffusion:
+            self.update_diffusion_params()
+
         self.fill_ids = self.origin_input_ids + self.output_ids
         if tree_cache is not None:
             if isinstance(tree_cache, LoRARadixCache):
@@ -913,6 +930,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = -1
 
+    # block diffusion
+    diffusion_block_size: int = 0
+
     @classmethod
     def init_new(
         cls,
@@ -924,6 +944,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
         chunked_req: Optional[Req] = None,
+        diffusion_block_size: int = 0,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 
@@ -954,6 +975,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 req.sampling_params.max_new_tokens == 0 for req in reqs
             ),
             chunked_req=chunked_req,
+            diffusion_block_size=diffusion_block_size,
         )
 
     def batch_size(self):
@@ -1713,6 +1735,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             else self.seq_lens.cpu()
         )
 
+        # Fixme: Add diffusion checks here if needed
+        diffusion_block_start = [req.block_start for req in self.reqs]
+        diffusion_block_size = self.diffusion_block_size
+
         global bid
         bid += 1
         return ModelWorkerBatch(
@@ -1763,6 +1789,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ),
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             launch_done=self.launch_done,
+            diffusion_block_start=diffusion_block_start,
+            diffusion_block_size=diffusion_block_size,
         )
 
     def copy(self):
@@ -1780,6 +1808,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
+            diffusion_block_size=self.diffusion_block_size,
         )
 
     def _evict_tree_cache_if_needed(self, num_tokens: int):
@@ -1905,6 +1934,9 @@ class ModelWorkerBatch:
     # Overlap event
     launch_done: Optional[threading.Event] = None
 
+    # Diffusion
+    diffusion_block_start: Optional[List[int]] = None
+    diffusion_block_size: Optional[int] = None
 
 @triton.jit
 def write_req_to_token_pool_triton(

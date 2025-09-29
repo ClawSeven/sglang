@@ -1891,6 +1891,7 @@ class ModelRunner:
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
+        save_kv_cache=True,
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
         self.forward_pass_id += 1
 
@@ -1904,6 +1905,7 @@ class ModelRunner:
                 pp_proxy_tensors,
                 reinit_attn_backend,
                 split_forward_count,
+                save_kv_cache,
             )
 
         if self.eplb_manager is not None:
@@ -1918,6 +1920,7 @@ class ModelRunner:
         pp_proxy_tensors: Optional[PPProxyTensors],
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
+        save_kv_cache=True,
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
         mode_check = (
             forward_batch.forward_mode.is_cpu_graph

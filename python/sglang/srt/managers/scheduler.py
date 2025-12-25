@@ -1915,6 +1915,7 @@ class Scheduler(
             for req in self.dllm_reqs:
                 adder.add_chunked_req(req)
             self.dllm_reqs.add_reqs(adder.dllm_reqs)
+            adder.filter_dllm_prefill_reqs()
         elif self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(adder.new_chunked_req)

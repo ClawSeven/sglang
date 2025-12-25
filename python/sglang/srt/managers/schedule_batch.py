@@ -503,6 +503,7 @@ class Req:
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
     ):
+        self.is_dllm_selected = False
         # Input and output info
         self.rid = rid
         self.origin_input_text = origin_input_text
@@ -818,6 +819,19 @@ class Req:
         return self.dllm_config is not None
 
     def _init_fill_ids_for_dllm(self):
+        if not self.is_dllm_selected:
+            # first time to init ?
+            if not self.dllm_ids:
+                self.dllm_ids = (
+                    self.origin_input_ids
+                    + [self.dllm_config.mask_id] * self.dllm_config.block_size
+                )
+                self.fill_ids = self.dllm_ids
+
+            return
+
+        self.is_dllm_selected = False
+
         if not self.dllm_ids:
             self.dllm_ids = (
                 self.origin_input_ids

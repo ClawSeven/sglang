@@ -385,6 +385,26 @@ class PrefillAdder:
         self.rem_diffusion_tokens = max_running_reqs * self.diffusion_block_size
         self.dllm_reqs = DllmReqs(dllm_config=dllm_config)
 
+    def filter_dllm_prefill_reqs(self):
+        if self.dllm_config is None:
+            return
+
+        mask_id = self.dllm_config.mask_id
+        block_size = self.dllm_config.block_size
+        prefill_reqs = []
+
+        for req in self.can_run_list:
+            prefix_len = len(req.prefix_indices)
+            input_ids = req.fill_ids[prefix_len : prefix_len + block_size]
+
+            is_decode = any(input_ids == mask_id)
+            if not is_decode:
+                req.is_dllm_selected = True
+                prefill_reqs.append(req)
+
+        if len(prefill_reqs) != 0:
+            self.can_run_list = prefill_reqs
+
     def _get_running_request_total_token_offset(self, req: Req) -> int:
         return (
             min(

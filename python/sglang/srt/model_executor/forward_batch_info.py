@@ -95,6 +95,9 @@ class ForwardMode(IntEnum):
     # Used in diffusion LLM inference
     DLLM_EXTEND = auto()
 
+    # Used in diffusion LLM inference
+    DLLM_DECODE = auto()
+
     def is_prefill(self):
         return self.is_extend()
 

@@ -467,6 +467,14 @@ class RequestStage(str, enum.Enum):
     DECODE_QUICK_FINISH = "quick_finish"
 
 
+class DllmReqStatus(str, enum.Enum):
+    STAGING_PREFILL = "staging_prefill"
+    STAGING_DECODE = "staging_decode"
+    INCOMING_PREFILL = "incoming_prefill"
+    INCOMING_DECODE = "incoming_decode"
+    NOT_DLLM = "not_dllm"
+
+
 class Req:
     """The input and output status of a request."""
 
@@ -741,9 +749,17 @@ class Req:
         self.dimensions = dimensions
 
         # For diffusion LLM
+        self.dllm_status = DllmReqStatus.NOT_DLLM
         self.dllm_ids = []
         self.dllm_block_offset = 0
         self.dllm_config = dllm_config
+
+        if self.dllm_config is not None:
+            # FIXME: replace block size with chunked prefill size later
+            if len(self.origin_input_ids) < self.dllm_config.block_size:
+                self.dllm_status = DllmReqStatus.INCOMING_DECODE
+            else:
+                self.dllm_status = DllmReqStatus.INCOMING_PREFILL
 
     @property
     def seqlen(self) -> int:
@@ -817,6 +833,30 @@ class Req:
     def is_dllm(self):
         return self.dllm_config is not None
 
+    def is_dllm_prefill(self) -> bool:
+        if self.dllm_status in [
+            DllmReqStatus.STAGING_PREFILL,
+            DllmReqStatus.INCOMING_PREFILL,
+        ]:
+            return True
+        else:
+            return False
+
+    # Must being called after init_next_round_input !
+    def update_dllm_status(self):
+        prefix_len = len(self.prefix_indices)
+        if len(self.fill_ids) < prefix_len + self.dllm_config.block_size:
+            # still incoming
+            return
+
+        input_ids = self.fill_ids[prefix_len : prefix_len + self.dllm_config.block_size]
+        is_prefill = not any(id_ == self.dllm_config.mask_id for id_ in input_ids)
+
+        if is_prefill:
+            self.dllm_status = DllmReqStatus.STAGING_PREFILL
+        else:
+            self.dllm_status = DllmReqStatus.STAGING_DECODE
+
     def _init_fill_ids_for_dllm(self):
         if not self.dllm_ids:
             self.dllm_ids = (
@@ -826,11 +866,13 @@ class Req:
         else:
             self.dllm_block_offset += self.dllm_config.block_size
             self.dllm_ids += [self.dllm_config.mask_id] * self.dllm_config.block_size
+
         self.fill_ids = self.dllm_ids
 
     def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
+            self.update_dllm_status()
         else:
             self.fill_ids = self.origin_input_ids + self.output_ids
 
@@ -1117,57 +1159,85 @@ class Req:
         )
 
 
-class DllmReqs:
+class DllmManager:
     def __init__(self, dllm_config: Optional[DllmConfig] = None):
         self.dllm_config = dllm_config
         self.max_running_reqs = (
             dllm_config.max_running_requests if dllm_config is not None else 1
         )
-        self.reqs: List[Req] = []
 
-    def add_reqs(self, req: Union[Req, List[Req], "DllmReqs"]):
+        # Waiting queue: all the requests waiting to be processed
+        # Staging queue: follow the resource allocation to run requests (From Prefill Adder)
+
+        self.waiting_queue: List[Req] = []
+        self.staging_queue: List[Req] = []
+
+    def generate_prefill_batch(self) -> List[Req]:
+        prefill_reqs = []
+        for req in self.waiting_queue:
+            if req.is_dllm_prefill():
+                prefill_reqs.append(req)
+
+        return prefill_reqs
+
+    def generate_decode_batch(self) -> List[Req]:
+        decode_reqs = []
+        for req in self.waiting_queue:
+            if not req.is_dllm_prefill():
+                decode_reqs.append(req)
+
+        return decode_reqs
+
+    def add_waiting_reqs(self, req: Union[Req, List[Req]]):
         assert self.dllm_config is not None, "Diffusion LLM config is not set."
 
-        if isinstance(req, DllmReqs):
-            reqs_to_add = req.reqs
-        elif isinstance(req, list):
+        if isinstance(req, list):
             reqs_to_add = req
         else:
             reqs_to_add = [req]
-
-        num_to_add = len(reqs_to_add)
 
         # Sanity check:
         if self.check_redundant_reqs(reqs_to_add):
             raise RuntimeError("Redundant requests detected in dLLM requests.")
 
-        if len(self.reqs) + num_to_add > self.max_running_reqs:
-            raise RuntimeError(
-                f"Exceeding maximum number of concurrent diffusion LLM requests: {self.max_running_reqs}"
-            )
+        self.waiting_queue.extend(reqs_to_add)
 
-        self.reqs.extend(reqs_to_add)
+    # Call by Prefill Adder
+    def update_staging_reqs(self, req: Union[Req, List[Req]]):
+        if isinstance(req, list):
+            reqs_to_add = req
+        else:
+            reqs_to_add = [req]
+
+        self.staging_queue.extend(reqs_to_add)
 
     def check_redundant_reqs(self, reqs: List[Req]) -> bool:
-        existing_rids: Set[str] = {r.rid for r in self.reqs}
+        existing_rids: Set[str] = {r.rid for r in self.waiting_queue}
         return any(req.rid in existing_rids for req in reqs)
 
-    def init_next_round(self):
-        for req in self.reqs:
-            req.init_next_round_input()
+    def has_staging_reqs(self) -> bool:
+        return self.dllm_config is not None and len(self.staging_queue) > 0
 
-    def has_running_reqs(self) -> bool:
-        return self.dllm_config is not None and len(self.reqs) > 0
+    def has_waiting_reqs(self) -> bool:
+        return self.dllm_config is not None and len(self.waiting_queue) > 0
 
     def update_chunked_status(self):
-        for req in self.reqs:
+        # dllm fixme
+        for req in self.staging_queue:
             req.is_chunked += 1
 
     def flush_finished_reqs(self):
-        self.reqs = [req for req in self.reqs if not req.finished()]
+        self.waiting_queue = [req for req in self.waiting_queue if not req.finished()]
+        self.staging_queue = [req for req in self.staging_queue if not req.finished()]
 
-    def __iter__(self):
-        return iter(self.reqs)
+    def has_waiting_reqs(self) -> bool:
+        return self.dllm_config is not None and len(self.waiting_queue) > 0
+
+    def init_unfinished_reqs_next_round(self):
+        for req in self.staging_queue:
+            req.init_next_round_input()
+
+        self.staging_queue = []
 
 
 @dataclasses.dataclass
@@ -1290,7 +1360,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     hicache_consumer_index: int = -1
 
     # Diffusion LLM
-    dllm_reqs: Optional[DllmReqs] = None
+    dllm_manager: Optional[DllmManager] = None
     dllm_config: Optional[DllmConfig] = None
 
     @classmethod
@@ -1304,7 +1374,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
         chunked_req: Optional[Req] = None,
-        dllm_reqs: Optional[DllmReqs] = None,
+        dllm_manager: Optional[DllmManager] = None,
         dllm_config: Optional[DllmConfig] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
@@ -1335,7 +1405,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_routed_experts=any(req.return_routed_experts for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
-            dllm_reqs=dllm_reqs,
+            dllm_manager=dllm_manager,
             dllm_config=dllm_config,
         )
 

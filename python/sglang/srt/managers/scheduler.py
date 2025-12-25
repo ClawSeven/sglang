@@ -121,6 +121,8 @@ from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
+    DllmManager,
+    DllmReqStatus,
     ModelWorkerBatch,
     MultimodalInputs,
     Req,
@@ -129,7 +131,6 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
-    DllmReqs,
     PrefillAdder,
     SchedulePolicy,
 )
@@ -750,7 +751,7 @@ class Scheduler(
                 self.enable_dynamic_chunking = False
 
     def init_diffusion_llm(self):
-        self.dllm_reqs = DllmReqs(dllm_config=self.dllm_config)
+        self.dllm_manager = DllmManager(dllm_config=self.dllm_config)
 
     def init_grammar_backend(self):
         self.grammar_queue: List[Req] = []
@@ -1288,7 +1289,7 @@ class Scheduler(
             # If it is a health check generation request and there are running requests, ignore it.
             if is_health_check_generate_req(recv_req) and (
                 self.chunked_req is not None
-                or self.dllm_reqs.has_running_reqs()
+                or self.dllm_manager.has_staging_reqs()
                 or not self.running_batch.is_empty()
                 or len(self.offload_tags) > 0
             ):
@@ -1758,14 +1759,14 @@ class Scheduler(
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         if self.dllm_config is not None:
-            self.dllm_reqs.flush_finished_reqs()
+            self.dllm_manager.flush_finished_reqs()
 
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
 
-        if self.dllm_config is not None and self.dllm_reqs.has_running_reqs():
-            chunked_req_to_exclude.update(self.dllm_reqs)
-            for req in self.dllm_reqs:
+        if self.dllm_config is not None and self.dllm_manager.has_staging_reqs():
+            chunked_req_to_exclude.update(self.dllm_manager.staging_queue)
+            for req in self.dllm_manager.staging_queue:
                 self._post_process_chunked_request(req)
         elif self.chunked_req is not None:
             assert (
@@ -1783,8 +1784,10 @@ class Scheduler(
                 # We need to discard it.
                 chunked_req_to_exclude.add(self.last_batch.chunked_req)
 
-            if self.last_batch.dllm_reqs.has_running_reqs():
-                chunked_req_to_exclude.update(self.last_batch.dllm_reqs)
+            if self.last_batch.dllm_manager.has_staging_reqs():
+                chunked_req_to_exclude.update(
+                    self.last_batch.dllm_manager.staging_queue
+                )
 
             # Filter batch
             last_bs = self.last_batch.batch_size()
@@ -1803,7 +1806,10 @@ class Scheduler(
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
 
-        new_batch = self.get_new_batch_prefill()
+        if self.dllm_config is not None:
+            new_batch = self.get_new_batch_dllm()
+        else:
+            new_batch = self.get_new_batch_prefill()
 
         need_mlp_sync = self.require_mlp_sync
         if need_mlp_sync and not self.spec_algorithm.is_none():
@@ -1840,6 +1846,196 @@ class Scheduler(
             res = min(res, self.req_to_token_pool.available_size())
         return res
 
+    def get_new_batch_dllm(self) -> Optional[ScheduleBatch]:
+        # Check if the grammar is ready in the grammar queue
+        if self.grammar_queue:
+            self.move_ready_grammar_requests()
+
+        if self.try_preemption:
+            # Reset batch_is_full to try preemption with a prefill adder.
+            self.running_batch.batch_is_full = False
+
+        # Handle the cases where prefill is not allowed
+        # FIXME: staging reqs maybe waiting req
+        if (
+            self.running_batch.batch_is_full or len(self.waiting_queue) == 0
+        ) and not self.dllm_manager.has_waiting_reqs():
+            return None
+
+        running_bs = len(self.running_batch.reqs)
+
+        # FIXME: maybe removed
+        if (
+            self.get_num_allocatable_reqs(running_bs) <= 0
+            and not self.dllm_manager.has_waiting_reqs()
+            and not self.try_preemption
+        ):
+            self.running_batch.batch_is_full = True
+            return None
+
+        # Get priority queue
+        # FIXME: may remove policy
+        self.policy.calc_priority(self.waiting_queue)
+
+        # Prefill policy / Resource manager
+        adder = PrefillAdder(
+            self.page_size,
+            self.tree_cache,
+            self.token_to_kv_pool_allocator,
+            self.running_batch,
+            self.new_token_ratio,
+            self.max_prefill_tokens,
+            self.chunked_prefill_size,
+            running_bs if self.is_mixed_chunk else 0,
+            self.priority_scheduling_preemption_threshold,
+            prefill_max_requests=self.server_args.prefill_max_requests,
+            dllm_config=self.dllm_config,
+        )
+
+        # The finished dllm reqs has been removed
+        self.dllm_manager.init_unfinished_reqs_next_round()
+
+        self.dllm_manager.add_waiting_reqs(self.waiting_queue)
+        self.waiting_queue = []
+
+        # TODO: add scheduling strategy abstraction for dllm reqs
+        prefill_batch = self.dllm_manager.generate_prefill_batch()
+        forward_mode = ForwardMode.DLLM_EXTEND
+
+        staging_result = AddReqResult.CONTINUE
+
+        # FIXME: merging iter_staging_reqs and iter_incoming_reqs
+        if prefill_batch:
+            staging_reqs = [
+                req
+                for req in prefill_batch
+                if req.dllm_status == DllmReqStatus.STAGING_PREFILL
+            ]
+
+            if staging_reqs:
+                staging_result = self.iter_staging_reqs(adder, staging_reqs)
+
+            if staging_result == AddReqResult.CONTINUE:
+                incoming_reqs = [
+                    req
+                    for req in prefill_batch
+                    if req.dllm_status == DllmReqStatus.INCOMING_PREFILL
+                ]
+                if incoming_reqs:
+                    self.iter_incoming_reqs(adder, incoming_reqs)
+        else:
+            # forward_mode = ForwardMode.DLLM_DECODE
+            # TODO: fixme: change extend to decode
+            forward_mode = ForwardMode.DLLM_EXTEND
+            decode_batch = self.dllm_manager.generate_decode_batch()
+
+            staging_reqs = [
+                req
+                for req in decode_batch
+                if req.dllm_status == DllmReqStatus.STAGING_DECODE
+            ]
+            if staging_reqs:
+                staging_result = self.iter_staging_reqs(adder, staging_reqs)
+
+            if staging_result == AddReqResult.CONTINUE:
+                incoming_reqs = [
+                    req
+                    for req in decode_batch
+                    if req.dllm_status == DllmReqStatus.INCOMING_DECODE
+                ]
+                if incoming_reqs:
+                    self.iter_incoming_reqs(adder, incoming_reqs)
+
+        # Update waiting queue
+        can_run_list: List[Req] = adder.can_run_list
+        if len(can_run_list) == 0:
+            return None
+
+        if self.enable_metrics:
+            # only record queue time when enable_metrics is True to avoid overhead
+            for req in can_run_list:
+                req.add_latency(RequestStage.PREFILL_WAITING)
+
+        if adder.preempt_list:
+            for req in adder.preempt_list:
+                self._add_request_to_queue(req)
+
+        if len(can_run_list) > 0:
+            self.dllm_manager.update_staging_reqs(can_run_list)
+            self.dllm_manager.update_chunked_status()
+
+        # Print stats
+        if self.current_scheduler_metrics_enabled:
+            self.log_prefill_stats(adder, can_run_list, running_bs, 0)
+
+        # Record metrics
+        for req in can_run_list:
+            if req.time_stats.forward_entry_time == 0:
+                req.time_stats.forward_entry_time = time.perf_counter()
+                if self.enable_metrics:
+                    self.metrics_collector.observe_queue_time(
+                        req.time_stats.get_queueing_time(),
+                    )
+
+        # Create a new batch
+        new_batch = ScheduleBatch.init_new(
+            can_run_list,
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+            self.spec_algorithm,
+            chunked_req=self.chunked_req,
+            dllm_manager=self.dllm_manager,
+            dllm_config=self.dllm_config,
+        )
+
+        new_batch.prepare_for_extend()
+
+        # FIXME: set mode in `prepare_for_extend`
+        new_batch.forward_mode = forward_mode
+        new_batch.decoding_reqs = None
+
+        return new_batch
+
+    def iter_incoming_reqs(self, adder: PrefillAdder, reqs: List[Req]) -> AddReqResult:
+        # Assumed all the reqs are incoming req
+        res = AddReqResult.CONTINUE
+        for req in reqs:
+            running_bs = len(self.running_batch.reqs)
+            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+                self.running_batch.batch_is_full = True
+
+            if self.running_batch.batch_is_full:
+                if not self.try_preemption or not adder.preempt_to_schedule(
+                    req, self.server_args
+                ):
+                    break
+
+            req.init_next_round_input(self.tree_cache)
+            res = adder.add_one_req(
+                req,
+                has_chunked_req=True,
+                truncation_align_size=self.truncation_align_size,
+            )
+
+            if res != AddReqResult.CONTINUE:
+                if res == AddReqResult.NO_TOKEN:
+                    self.running_batch.batch_is_full = True
+                break
+
+        return res
+
+    def iter_staging_reqs(self, adder: PrefillAdder, reqs: List[Req]) -> AddReqResult:
+        res = AddReqResult.CONTINUE
+        for req in reqs:
+            res = adder.add_dllm_chunked_req(req)
+            if res == AddReqResult.NO_TOKEN:
+                return res
+
+        return res
+
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         if self.schedule_enhancer and not self.schedule_enhancer.get_schedule_decision(
             self.running_batch
@@ -1856,9 +2052,9 @@ class Scheduler(
             self.running_batch.batch_is_full = False
 
         # Handle the cases where prefill is not allowed
-        if (self.running_batch.batch_is_full or len(self.waiting_queue) == 0) and (
-            not self.dllm_reqs.has_running_reqs() and self.chunked_req is None
-        ):
+        if (
+            self.running_batch.batch_is_full or len(self.waiting_queue) == 0
+        ) and self.chunked_req is None:
             return None
 
         running_bs = len(self.running_batch.reqs)
@@ -1869,7 +2065,7 @@ class Scheduler(
         # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
         if (
             self.get_num_allocatable_reqs(running_bs) <= 0
-            and (not self.dllm_reqs.has_running_reqs() or self.chunked_req is not None)
+            and self.chunked_req is not None
             and not self.try_preemption
         ):
             self.running_batch.batch_is_full = True
@@ -1910,12 +2106,7 @@ class Scheduler(
             dllm_config=self.dllm_config,
         )
 
-        if self.dllm_config is not None and self.dllm_reqs.has_running_reqs():
-            self.dllm_reqs.init_next_round()
-            for req in self.dllm_reqs:
-                adder.add_chunked_req(req)
-            self.dllm_reqs.add_reqs(adder.dllm_reqs)
-        elif self.chunked_req is not None:
+        if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
@@ -1965,9 +2156,7 @@ class Scheduler(
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,
-                has_chunked_req=(
-                    self.dllm_reqs.has_running_reqs() or self.chunked_req is not None
-                ),
+                has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
 
@@ -1999,18 +2188,13 @@ class Scheduler(
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
 
-        if self.dllm_config is not None and adder.dllm_reqs.has_running_reqs():
-            self.dllm_reqs.add_reqs(adder.dllm_reqs)
-        elif adder.new_chunked_req is not None:
+        if adder.new_chunked_req is not None:
             # Update chunked prefill
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
 
         if self.chunked_req is not None:
             self.chunked_req.is_chunked += 1
-
-        if self.dllm_reqs.has_running_reqs():
-            self.dllm_reqs.update_chunked_status()
 
         # Print stats
         if self.current_scheduler_metrics_enabled:
@@ -2035,7 +2219,7 @@ class Scheduler(
             self.enable_overlap,
             self.spec_algorithm,
             chunked_req=self.chunked_req,
-            dllm_reqs=self.dllm_reqs,
+            dllm_manager=self.dllm_manager,
             dllm_config=self.dllm_config,
         )
         if self.enable_hierarchical_cache:

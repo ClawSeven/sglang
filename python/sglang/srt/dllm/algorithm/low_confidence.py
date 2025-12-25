@@ -48,6 +48,8 @@ class LowConfidence(DllmAlgorithm):
             start = self.block_size - torch.sum(block_mask_index).item()
             start_list.append(start)
 
+        redundant_count = 0
+
         for _ in range(self.block_size):
             mask_index = forward_batch.input_ids == self.mask_id
             if torch.sum(mask_index).item() == 0:
@@ -64,6 +66,7 @@ class LowConfidence(DllmAlgorithm):
                 ]
                 block_mask_index = block_input_ids == self.mask_id
                 if torch.sum(block_mask_index).item() == 0:
+                    redundant_count += 1
                     continue
                 curr_logits = logits_output.full_logits[
                     curr_block_start:curr_block_end,
@@ -88,6 +91,11 @@ class LowConfidence(DllmAlgorithm):
                     transfer_index[select_index] = True
 
                 block_input_ids[transfer_index] = x[transfer_index]
+
+        if redundant_count != 0:
+            print(
+                f"[LowConfidence] redundant forward count: {redundant_count}, bs={batch_size}",
+            )
 
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph

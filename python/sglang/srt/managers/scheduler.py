@@ -1811,7 +1811,15 @@ class Scheduler(
             self.handle_embedding_request(tokenized_req)
 
     def stash_chunked_request(self, req: Req):
-        self.tree_cache.cache_unfinished_req(req, chunked=True)
+        if not req.skip_initialization():
+            self.tree_cache.cache_unfinished_req(req, chunked=True)
+        else:
+            # TODO(clawseven): not remove the kv prefixes as we will reuse it in the next round.
+            # When prepare for extend support reusing, delete this branch
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : self.dllm_config.block_size
+            ]
+            self.token_to_kv_pool_allocator.free(kv_indices)
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         self._abort_on_queued_timeout()

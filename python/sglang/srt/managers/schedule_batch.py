@@ -870,7 +870,12 @@ class Req(ReqDllmMixin):
     def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
-            self.determine_dllm_phase()
+
+            if not self.skip_initialization():
+                self.determine_dllm_start_offset()
+                self.determine_dllm_phase()
+            else:
+                self.recover_phase()
         else:
             self.fill_ids = self.origin_input_ids + self.output_ids
 
@@ -2212,6 +2217,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_prefill_only=self.is_prefill_only,
             dimensions=self.dimensions,
             dllm_block_offsets=[req.dllm_block_offset for req in self.reqs],
+            dllm_start_offsets=[req.dllm_start_offset for req in self.reqs],
             dllm_config=self.dllm_config,
             reqs=self.reqs,
             has_grammar=self.has_grammar,
@@ -2390,6 +2396,7 @@ class ModelWorkerBatch:
 
     # Diffusion LLM
     dllm_block_offsets: Optional[List[int]] = None
+    dllm_start_offsets: Optional[List[int]] = None
     dllm_config: Optional[DllmConfig] = None
 
     # For constrained decoding

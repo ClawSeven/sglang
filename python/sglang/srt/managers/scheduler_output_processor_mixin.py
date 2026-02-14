@@ -395,15 +395,36 @@ class SchedulerOutputProcessorMixin:
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
+        # Prefilling stage
+        if not result.next_token_ids:
+            return
+
         self.token_to_kv_pool_allocator.free_group_begin()
 
         for idx in range(batch.batch_size()):
-            # If no new tokens generated, meaning the prefilling stage
-            if not result.next_token_ids:
-                break
-
             req = batch.reqs[idx]
-            next_token_ids = result.next_token_ids[idx].tolist()
+            next_token_ids_tensor = result.next_token_ids[idx]
+
+            # Skip blocks with no tokens (early exit case: empty tensor)
+            if next_token_ids_tensor.numel() == 0:
+                req.mark_partial_decode()
+
+                block_size = batch.dllm_config.block_size
+
+                block_start = idx * block_size
+                block_end = block_start + block_size
+                block_input_ids = batch.input_ids[block_start:block_end]
+
+                prefix_length = len(req.prefix_indices)
+
+                req.dllm_ids = req.dllm_ids[:prefix_length] + block_input_ids.tolist()
+                assert (
+                    156895 in block_input_ids.tolist()
+                ), f"no mask in {block_input_ids.tolist()}"
+
+                continue
+
+            next_token_ids = next_token_ids_tensor.tolist()
             self.num_generated_tokens += len(next_token_ids)
 
             for _token_idx, next_token_id in enumerate(next_token_ids):
@@ -413,8 +434,6 @@ class SchedulerOutputProcessorMixin:
                     release_kv_cache(req, self.tree_cache)
                     req.time_stats.completion_time = time.perf_counter()
                     break
-
-                self.tree_cache.cache_unfinished_req(req)
 
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()

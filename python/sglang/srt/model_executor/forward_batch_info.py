@@ -375,6 +375,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
+    # For diffusion LLM
+    dllm_start_offsets: Optional[List[int]] = None
+
     @classmethod
     def init_new(
         cls,
@@ -475,6 +478,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ],
                 dtype=positions_dtype,
             ).to(device, non_blocking=True)
+
+            ret.dllm_start_offsets = batch.dllm_start_offsets
         elif (
             ret.spec_info is not None
             and getattr(ret.spec_info, "positions", None) is not None

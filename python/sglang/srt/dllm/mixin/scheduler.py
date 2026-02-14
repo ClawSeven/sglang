@@ -309,5 +309,6 @@ class DllmManager:
     def init_next_round(self) -> None:
         """Initialize staging requests for next round and clear staging queue."""
         for req in self.staging_queue:
+            # If the DLLM current block is not finished, skip the next round initialization
             req.init_next_round_input()
         self.staging_queue = []

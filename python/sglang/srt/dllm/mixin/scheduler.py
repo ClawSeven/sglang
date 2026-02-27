@@ -1,19 +1,360 @@
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, List, Optional, Set, Union
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.managers.schedule_policy import AddReqResult
+from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
 
 logger = logging.getLogger(__name__)
 
+CLIP_MAX_NEW_TOKENS = 4096
+IGNORE_EOS_RESERVE_TOKENS = 1
+
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+
+
+class DllmPrefillAdder:
+    """
+    Prefill adder for Diffusion LLM (DLLM) scheduling.
+
+    This is a simplified version of PrefillAdder that:
+    - Keeps core prefill adder functionality (budget management, token tracking)
+    - Keeps DLLM-specific capabilities (block-based token allocation)
+    - Keeps SWA (Sliding Window Attention) support
+    - Removes hicache / priority scheduling / prefill_delayer / preempt features
+    """
+
+    def __init__(
+        self,
+        page_size: int,
+        tree_cache: BasePrefixCache,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+        running_batch: ScheduleBatch,
+        new_token_ratio: float,
+        rem_input_tokens: int,
+        dllm_config: Optional[DllmConfig] = None,
+    ):
+        self.page_size = page_size
+        self.tree_cache = tree_cache
+        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.running_batch = running_batch
+        self.new_token_ratio = new_token_ratio
+        self.rem_input_tokens = rem_input_tokens
+        self.dllm_config = dllm_config
+
+        # Initialize DLLM-specific metadata
+        if self.dllm_config is not None:
+            self._init_dllm_meta(dllm_config)
+
+        self.rem_total_token_offset = 0
+        self.cur_rem_token_offset = 0
+
+        self.can_run_list: List[Req] = []
+        self.log_hit_tokens = 0
+        self.log_input_tokens = 0
+
+        # For ignore_eos support: track token states of all requests
+        self.req_states: Optional[List[tuple]] = None
+
+        if running_batch is not None:
+            self.rem_total_token_offset += sum(
+                [
+                    self._get_running_request_total_token_offset(r)
+                    for r in running_batch.reqs
+                ]
+            )
+
+        # SWA support
+        self.is_hybrid_swa = isinstance(
+            self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
+        )
+
+    def _init_dllm_meta(self, dllm_config: DllmConfig):
+        self.dllm_block_size = dllm_config.block_size
+        max_running_reqs = dllm_config.max_running_requests
+        self.rem_dllm_tokens = max_running_reqs * self.dllm_block_size
+
+    def _get_running_request_total_token_offset(self, req: Req) -> int:
+        return (
+            min(
+                (req.sampling_params.max_new_tokens - len(req.output_ids)),
+                CLIP_MAX_NEW_TOKENS,
+            )
+            * self.new_token_ratio
+        )
+
+    @property
+    def rem_total_tokens(self):
+        if self.is_hybrid_swa:
+            available_and_evictable = min(
+                self.token_to_kv_pool_allocator.full_available_size()
+                + self.tree_cache.full_evictable_size(),
+                self.token_to_kv_pool_allocator.swa_available_size()
+                + self.tree_cache.swa_evictable_size(),
+            )
+        else:
+            available_and_evictable = (
+                self.token_to_kv_pool_allocator.available_size()
+                + self.tree_cache.evictable_size()
+            )
+        return available_and_evictable - self.rem_total_token_offset
+
+    @property
+    def cur_rem_tokens(self):
+        if self.is_hybrid_swa:
+            available_and_evictable = min(
+                self.token_to_kv_pool_allocator.full_available_size()
+                + self.tree_cache.full_evictable_size(),
+                self.token_to_kv_pool_allocator.swa_available_size()
+                + self.tree_cache.swa_evictable_size(),
+            )
+        else:
+            available_and_evictable = (
+                self.token_to_kv_pool_allocator.available_size()
+                + self.tree_cache.evictable_size()
+            )
+        return available_and_evictable - self.cur_rem_token_offset
+
+    def ceil_paged_tokens(self, tokens: int) -> int:
+        return -(-tokens // self.page_size) * self.page_size
+
+    def budget_state(self):
+        if self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0:
+            return AddReqResult.NO_TOKEN
+
+        if self.rem_input_tokens <= 0:
+            return AddReqResult.OTHER
+
+        if self.rem_dllm_tokens <= 0:
+            return AddReqResult.OTHER
+
+        return AddReqResult.CONTINUE
+
+    def _update_prefill_budget(
+        self, prefix_len: int, extend_input_len: int, max_new_tokens: int
+    ):
+        extend_input_len = self.ceil_paged_tokens(extend_input_len)
+
+        self.rem_total_token_offset += extend_input_len + max_new_tokens
+        self.cur_rem_token_offset += extend_input_len
+        self.rem_input_tokens -= extend_input_len
+
+        if self.dllm_config is not None:
+            self.rem_dllm_tokens -= extend_input_len
+
+        self.log_hit_tokens += prefix_len
+        self.log_input_tokens += extend_input_len
+
+    def _get_dllm_remain_tokens(self) -> int:
+        _rem_tokens = min(
+            self.rem_dllm_tokens,
+            self.dllm_block_size,
+            int(self.rem_total_tokens),
+        )
+        if _rem_tokens <= 0:
+            _rem_tokens = self.rem_dllm_tokens
+
+        return _rem_tokens
+
+    def _add_dllm_req(self, req: Req, prefix_len: int):
+        # Make sure at least one page is available
+        trunc_len = (
+            min(self.rem_dllm_tokens, self.dllm_block_size)
+            // self.page_size
+            * self.page_size
+        )
+
+        req.extend_input_len = trunc_len
+        req.fill_ids = req.fill_ids[: prefix_len + trunc_len]
+
+        self.can_run_list.append(req)
+
+        self._update_prefill_budget(prefix_len, trunc_len, 0)
+
+    def _req_inc_lock_ref(self, req: Req):
+        if self.is_hybrid_swa:
+            swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
+            req.swa_uuid_for_lock = swa_uuid_for_lock
+        else:
+            self.tree_cache.inc_lock_ref(req.last_node)
+
+    @contextmanager
+    def _lock_node(self, last_node):
+        try:
+            if self.is_hybrid_swa and self.tree_cache.is_tree_cache():
+                swa_uuid_for_lock = self.tree_cache.inc_lock_ref(last_node)
+            else:
+                self.tree_cache.inc_lock_ref(last_node)
+            yield None
+        finally:
+            if self.is_hybrid_swa and self.tree_cache.is_tree_cache():
+                self.tree_cache.dec_lock_ref(last_node, swa_uuid_for_lock)
+            else:
+                self.tree_cache.dec_lock_ref(last_node)
+
+    def add_dllm_staging_req(self, req: Req):
+        """
+        Process staging DLLM requests with resource allocation.
+
+        Staging requests are those that have already been allocated resources
+        in a previous scheduling round and need to continue processing.
+        """
+        assert self.dllm_config is not None
+        _rem_tokens = self._get_dllm_remain_tokens()
+
+        if _rem_tokens <= 0:
+            return AddReqResult.NO_TOKEN
+
+        # Truncate input length to available tokens and update request metadata
+        truncated = req.extend_input_len > _rem_tokens
+        req.extend_input_len = min(req.extend_input_len, _rem_tokens)
+        req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
+        self.can_run_list.append(req)
+
+        # Update budget: reserve max_new_tokens only if not truncated
+        max_new_tokens = (
+            min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+            if not truncated
+            else 0
+        )
+        self._update_prefill_budget(0, req.extend_input_len, max_new_tokens)
+
+        # Return based on remaining token availability
+        return (
+            AddReqResult.NO_TOKEN
+            if self._get_dllm_remain_tokens() <= 0
+            else AddReqResult.CONTINUE
+        )
+
+    def add_one_req_ignore_eos(self, req: Req):
+        """
+        Add one DLLM request with ignore_eos=True handling.
+
+        This method tracks token states of all requests to ensure sufficient memory
+        when ignore_eos is enabled (requests may generate unlimited tokens).
+        """
+        # Early exit if no enough tokens for the input tokens
+        if self.ceil_paged_tokens(req.extend_input_len) > min(
+            self.cur_rem_tokens, self.rem_total_tokens
+        ):
+            return AddReqResult.NO_TOKEN
+
+        # FIXME: reduce redundant implementation
+        def add_req_state(r, insert_sort=False):
+            new_token_ratio = (
+                1.0 if r.sampling_params.ignore_eos else self.new_token_ratio
+            )
+            tokens_left = r.sampling_params.max_new_tokens * new_token_ratio - len(
+                r.output_ids
+            )
+            tokens_occupied = len(r.origin_input_ids) + len(r.output_ids)
+
+            if tokens_left <= 0:
+                return
+
+            if not insert_sort:
+                self.req_states.append((tokens_left, tokens_occupied))
+            else:
+                i = 0
+                for i in range(len(self.req_states)):
+                    if tokens_left <= self.req_states[i][0]:
+                        break
+                self.req_states.insert(i, (tokens_left, tokens_occupied))
+
+        if self.req_states is None:
+            self.req_states = []
+            add_req_state(req)
+            if self.running_batch is not None:
+                for r in self.running_batch.reqs:
+                    add_req_state(r)
+            for r in self.can_run_list:
+                add_req_state(r)
+            self.req_states.sort(key=lambda x: x[0])
+        else:
+            add_req_state(req, insert_sort=True)
+
+        if not self.is_hybrid_swa:
+            # Skip this logic for swa. The SWA has different memory management, and
+            # this mechanism is underestimating the memory usage.
+            cur_rem_tokens = self.cur_rem_tokens - self.ceil_paged_tokens(
+                req.extend_input_len
+            )
+            tokens_freed = 0
+            for i, (tokens_left, tokens_occupied) in enumerate(self.req_states):
+                # tokens_left gives a reservative calculation as the last token is not stored
+                bs = len(self.req_states) - i
+                min_free_tokens = cur_rem_tokens + tokens_freed - tokens_left * bs
+                # reserve tokens for corner cases
+                if min_free_tokens <= IGNORE_EOS_RESERVE_TOKENS * bs:
+                    return AddReqResult.NO_TOKEN
+                tokens_freed += tokens_occupied
+
+        if self.rem_dllm_tokens <= 0:
+            return AddReqResult.OTHER
+
+        # For DLLM, use block-based allocation
+        self._add_dllm_req(req, 0)
+        self._req_inc_lock_ref(req)
+
+        return self.budget_state()
+
+    def add_one_req(self, req: Req):
+        """
+        Add one DLLM incoming request.
+
+        Simplified version without:
+        - hicache (host_hit_length) support
+        - priority scheduling preemption
+        - prefill_delayer
+        - prefill_max_requests limit
+        - preempt_to_schedule
+        - has_chunked_req check
+        """
+        # Handle ignore_eos case when tree cache is disabled
+        if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
+            return self.add_one_req_ignore_eos(req)
+
+        total_tokens = req.extend_input_len + min(
+            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+            CLIP_MAX_NEW_TOKENS,
+        )
+
+        input_tokens = self.ceil_paged_tokens(req.extend_input_len)
+        prefix_len = len(req.prefix_indices)
+
+        if total_tokens >= self.rem_total_tokens:
+            return AddReqResult.NO_TOKEN
+
+        if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
+            return AddReqResult.OTHER
+
+        with self._lock_node(req.last_node):
+            # self.rem_total_tokens may decrease after the lock acquisition
+            if total_tokens >= self.rem_total_tokens:
+                return AddReqResult.NO_TOKEN
+
+            input_tokens = self.ceil_paged_tokens(req.extend_input_len)
+
+            if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
+                return AddReqResult.OTHER
+
+            if self.rem_dllm_tokens <= 0:
+                return AddReqResult.OTHER
+
+            self._add_dllm_req(req, prefix_len)
+            self._req_inc_lock_ref(req)
+
+        return self.budget_state()
 
 
 class SchedulerDllmMixin:
@@ -82,30 +423,27 @@ class SchedulerDllmMixin:
         if (
             self.get_num_allocatable_reqs(running_bs) <= 0
             and self.dllm_manager.is_empty()
-            and not self.try_preemption
         ):
             self.running_batch.batch_is_full = True
             return True
 
         return False
 
-    def _create_dllm_prefill_adder(self: Scheduler, running_bs: int) -> PrefillAdder:
+    def _create_dllm_prefill_adder(
+        self: Scheduler, running_bs: int
+    ) -> DllmPrefillAdder:
         """Create a prefill adder configured for DLLM scheduling."""
-        return PrefillAdder(
-            self.page_size,
-            self.tree_cache,
-            self.token_to_kv_pool_allocator,
-            self.running_batch,
-            self.new_token_ratio,
-            self.max_prefill_tokens,
-            self.chunked_prefill_size,
-            running_bs if self.is_mixed_chunk else 0,
-            self.priority_scheduling_preemption_threshold,
-            prefill_max_requests=self.server_args.prefill_max_requests,
+        return DllmPrefillAdder(
+            page_size=self.page_size,
+            tree_cache=self.tree_cache,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            running_batch=self.running_batch,
+            new_token_ratio=self.new_token_ratio,
+            rem_input_tokens=self.max_prefill_tokens,
             dllm_config=self.dllm_config,
         )
 
-    def _process_dllm_batches(self: Scheduler, adder: PrefillAdder) -> ForwardMode:
+    def _process_dllm_batches(self: Scheduler, adder: DllmPrefillAdder) -> ForwardMode:
         """Process prefill or decode batches for DLLM."""
         forward_mode = ForwardMode.DLLM_EXTEND
 
@@ -132,7 +470,7 @@ class SchedulerDllmMixin:
 
     def _process_batch_by_phase(
         self,
-        adder: PrefillAdder,
+        adder: DllmPrefillAdder,
         batch: List[Req],
         staging_phase: DllmReqPhase,
         incoming_phase: DllmReqPhase,
@@ -149,13 +487,12 @@ class SchedulerDllmMixin:
             self.process_dllm_incoming_reqs(adder, incoming_reqs)
 
     def _update_state_for_batch(
-        self: Scheduler, can_run_list: List[Req], adder: PrefillAdder, running_bs: int
+        self: Scheduler,
+        can_run_list: List[Req],
+        adder: DllmPrefillAdder,
+        running_bs: int,
     ) -> None:
         """Update state for the batch."""
-
-        if adder.preempt_list:
-            for req in adder.preempt_list:
-                self._add_request_to_queue(req)
 
         if can_run_list:
             self.dllm_manager.add_staging_reqs(can_run_list)
@@ -197,30 +534,20 @@ class SchedulerDllmMixin:
         return new_batch
 
     def process_dllm_incoming_reqs(
-        self: Scheduler, adder: PrefillAdder, reqs: List[Req]
+        self: Scheduler, adder: DllmPrefillAdder, reqs: List[Req]
     ) -> AddReqResult:
-        """Process incoming DLLM requests with resource allocation and preemption."""
+        """Process incoming DLLM requests with resource allocation."""
         res = AddReqResult.CONTINUE
         for req in reqs:
             # Check if batch is full
             running_bs = len(self.running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
                 self.running_batch.batch_is_full = True
-
-            # Try preemption if batch is full
-            if self.running_batch.batch_is_full:
-                if not self.try_preemption or not adder.preempt_to_schedule(
-                    req, self.server_args
-                ):
-                    break
+                break
 
             # Prepare and add request
             req.init_next_round_input(self.tree_cache)
-            res = adder.add_one_req(
-                req,
-                has_chunked_req=True,
-                truncation_align_size=self.truncation_align_size,
-            )
+            res = adder.add_one_req(req)
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
@@ -230,7 +557,7 @@ class SchedulerDllmMixin:
         return res
 
     def process_dllm_staging_reqs(
-        self: Scheduler, adder: PrefillAdder, reqs: List[Req]
+        self: Scheduler, adder: DllmPrefillAdder, reqs: List[Req]
     ) -> AddReqResult:
         """Process staging DLLM requests with resource allocation."""
         for req in reqs:
@@ -247,7 +574,7 @@ class DllmManager:
 
     Maintains two queues:
     - waiting_queue: The requests waiting to be scheduled with max running requests limit
-    - staging_queue: Requests allocated resources by PrefillAdder
+    - staging_queue: Requests allocated resources by DllmPrefillAdder
     """
 
     def __init__(self, dllm_config: Optional[DllmConfig] = None):
@@ -279,7 +606,7 @@ class DllmManager:
         self.waiting_queue.extend(reqs_to_add)
 
     def add_staging_reqs(self, reqs: Union[Req, List[Req]]) -> None:
-        """Add requests to staging queue (allocated by PrefillAdder)."""
+        """Add requests to staging queue (allocated by DllmPrefillAdder)."""
         reqs_to_add = reqs if isinstance(reqs, list) else [reqs]
         self.staging_queue.extend(reqs_to_add)
 

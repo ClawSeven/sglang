@@ -5,7 +5,6 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, List, Optional, Set, Union
 
 from sglang.srt.dllm.config import DllmConfig
-from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
@@ -202,13 +201,23 @@ class DllmPrefillAdder:
             else:
                 self.tree_cache.dec_lock_ref(last_node)
 
-    def add_dllm_staging_req(self, req: Req):
+    def add_req(self, req: Req):
         """
-        Process staging DLLM requests with resource allocation.
+        Add one DLLM request (either incoming or staging).
 
-        Staging requests are those that have already been allocated resources
-        in a previous scheduling round and need to continue processing.
+        Uses req.is_incoming to differentiate behavior:
+        - Incoming requests: Need full validation, locking, and initialization
+        - Staging requests: Already have resources allocated, skip locking
         """
+        # Staging requests: already have resources, skip locking
+        if not req.is_incoming:
+            return self._add_staging_req(req)
+
+        # Incoming requests: full validation and locking required
+        return self._add_incoming_req(req)
+
+    def _add_staging_req(self, req: Req) -> AddReqResult:
+        """Handle staging request - resources already allocated."""
         assert self.dllm_config is not None
         _rem_tokens = self._get_dllm_remain_tokens()
 
@@ -235,6 +244,44 @@ class DllmPrefillAdder:
             if self._get_dllm_remain_tokens() <= 0
             else AddReqResult.CONTINUE
         )
+
+    def _add_incoming_req(self, req: Req) -> AddReqResult:
+        """Handle incoming request - needs full validation and locking."""
+        # Handle ignore_eos case when tree cache is disabled
+        if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
+            return self.add_one_req_ignore_eos(req)
+
+        total_tokens = req.extend_input_len + min(
+            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+            CLIP_MAX_NEW_TOKENS,
+        )
+
+        input_tokens = self.ceil_paged_tokens(req.extend_input_len)
+        prefix_len = len(req.prefix_indices)
+
+        if total_tokens >= self.rem_total_tokens:
+            return AddReqResult.NO_TOKEN
+
+        if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
+            return AddReqResult.OTHER
+
+        with self._lock_node(req.last_node):
+            # self.rem_total_tokens may decrease after the lock acquisition
+            if total_tokens >= self.rem_total_tokens:
+                return AddReqResult.NO_TOKEN
+
+            input_tokens = self.ceil_paged_tokens(req.extend_input_len)
+
+            if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
+                return AddReqResult.OTHER
+
+            if self.rem_dllm_tokens <= 0:
+                return AddReqResult.OTHER
+
+            self._add_dllm_req(req, prefix_len)
+            self._req_inc_lock_ref(req)
+
+        return self.budget_state()
 
     def add_one_req_ignore_eos(self, req: Req):
         """
@@ -305,54 +352,6 @@ class DllmPrefillAdder:
         # For DLLM, use block-based allocation
         self._add_dllm_req(req, 0)
         self._req_inc_lock_ref(req)
-
-        return self.budget_state()
-
-    def add_one_req(self, req: Req):
-        """
-        Add one DLLM incoming request.
-
-        Simplified version without:
-        - hicache (host_hit_length) support
-        - priority scheduling preemption
-        - prefill_delayer
-        - prefill_max_requests limit
-        - preempt_to_schedule
-        - has_chunked_req check
-        """
-        # Handle ignore_eos case when tree cache is disabled
-        if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
-            return self.add_one_req_ignore_eos(req)
-
-        total_tokens = req.extend_input_len + min(
-            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
-            CLIP_MAX_NEW_TOKENS,
-        )
-
-        input_tokens = self.ceil_paged_tokens(req.extend_input_len)
-        prefix_len = len(req.prefix_indices)
-
-        if total_tokens >= self.rem_total_tokens:
-            return AddReqResult.NO_TOKEN
-
-        if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
-            return AddReqResult.OTHER
-
-        with self._lock_node(req.last_node):
-            # self.rem_total_tokens may decrease after the lock acquisition
-            if total_tokens >= self.rem_total_tokens:
-                return AddReqResult.NO_TOKEN
-
-            input_tokens = self.ceil_paged_tokens(req.extend_input_len)
-
-            if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
-                return AddReqResult.OTHER
-
-            if self.rem_dllm_tokens <= 0:
-                return AddReqResult.OTHER
-
-            self._add_dllm_req(req, prefix_len)
-            self._req_inc_lock_ref(req)
 
         return self.budget_state()
 
@@ -450,39 +449,29 @@ class SchedulerDllmMixin:
         # Try prefill batch first
         prefill_reqs = self.dllm_manager.get_prefill_requests()
         if prefill_reqs:
-            self._process_batch_by_phase(
-                adder,
-                prefill_reqs,
-                DllmReqPhase.STAGING_PREFILL,
-                DllmReqPhase.INCOMING_PREFILL,
-            )
+            self._process_dllm_batch(adder, prefill_reqs)
         else:
             # Fall back to decode batch
             decode_reqs = self.dllm_manager.get_decode_requests()
-            self._process_batch_by_phase(
-                adder,
-                decode_reqs,
-                DllmReqPhase.STAGING_DECODE,
-                DllmReqPhase.INCOMING_DECODE,
-            )
+            self._process_dllm_batch(adder, decode_reqs)
 
         return forward_mode
 
-    def _process_batch_by_phase(
+    def _process_dllm_batch(
         self,
         adder: DllmPrefillAdder,
         batch: List[Req],
-        staging_phase: DllmReqPhase,
-        incoming_phase: DllmReqPhase,
     ) -> None:
-        """Process a batch, separating staging and incoming requests."""
-        staging_reqs = [req for req in batch if req.dllm_phase == staging_phase]
+        """Process a batch, separating staging and incoming requests using is_incoming."""
+        # Process staging requests first (is_incoming=False)
+        staging_reqs = [req for req in batch if not req.is_incoming]
         if staging_reqs:
             staging_result = self.process_dllm_staging_reqs(adder, staging_reqs)
             if staging_result != AddReqResult.CONTINUE:
                 return
 
-        incoming_reqs = [req for req in batch if req.dllm_phase == incoming_phase]
+        # Then process incoming requests (is_incoming=True)
+        incoming_reqs = [req for req in batch if req.is_incoming]
         if incoming_reqs:
             self.process_dllm_incoming_reqs(adder, incoming_reqs)
 
@@ -533,39 +522,52 @@ class SchedulerDllmMixin:
 
         return new_batch
 
-    def process_dllm_incoming_reqs(
-        self: Scheduler, adder: DllmPrefillAdder, reqs: List[Req]
+    def process_dllm_reqs(
+        self: Scheduler,
+        adder: DllmPrefillAdder,
+        reqs: List[Req],
+        check_batch_full: bool = False,
     ) -> AddReqResult:
-        """Process incoming DLLM requests with resource allocation."""
+        """Process DLLM requests with resource allocation.
+
+        Args:
+            adder: The prefill adder for resource management
+            reqs: List of requests to process
+            check_batch_full: If True, check batch capacity before adding each request
+                              (used for incoming requests)
+        """
         res = AddReqResult.CONTINUE
         for req in reqs:
-            # Check if batch is full
-            running_bs = len(self.running_batch.reqs)
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
-                self.running_batch.batch_is_full = True
-                break
+            if check_batch_full:
+                # Check if batch is full (only for incoming requests)
+                running_bs = len(self.running_batch.reqs)
+                if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+                    self.running_batch.batch_is_full = True
+                    break
 
-            # Prepare and add request
-            req.init_next_round_input(self.tree_cache)
-            res = adder.add_one_req(req)
+                # Prepare incoming request
+                req.init_next_round_input(self.tree_cache)
+
+            res = adder.add_req(req)
 
             if res != AddReqResult.CONTINUE:
-                if res == AddReqResult.NO_TOKEN:
+                if res == AddReqResult.NO_TOKEN and check_batch_full:
                     self.running_batch.batch_is_full = True
                 break
 
         return res
 
+    def process_dllm_incoming_reqs(
+        self: Scheduler, adder: DllmPrefillAdder, reqs: List[Req]
+    ) -> AddReqResult:
+        """Process incoming DLLM requests with resource allocation."""
+        return self.process_dllm_reqs(adder, reqs, check_batch_full=True)
+
     def process_dllm_staging_reqs(
         self: Scheduler, adder: DllmPrefillAdder, reqs: List[Req]
     ) -> AddReqResult:
         """Process staging DLLM requests with resource allocation."""
-        for req in reqs:
-            res = adder.add_dllm_staging_req(req)
-            if res == AddReqResult.NO_TOKEN:
-                return res
-
-        return AddReqResult.CONTINUE
+        return self.process_dllm_reqs(adder, reqs, check_batch_full=False)
 
 
 class DllmManager:
@@ -638,5 +640,6 @@ class DllmManager:
     def init_next_round(self) -> None:
         """Initialize staging requests for next round and clear staging queue."""
         for req in self.staging_queue:
+            req.is_incoming = False  # Mark as staging request for next round
             req.init_next_round_input()
         self.staging_queue = []

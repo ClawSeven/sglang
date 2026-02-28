@@ -368,7 +368,9 @@ class AddReqResult(Enum):
     OTHER = auto()  # Other reasons to stop adding requests
 
 
-class PrefillAdder:
+class PrefillAdderBase:
+    """Base class for prefill adders with shared utilities."""
+
     def __init__(
         self,
         page_size: int,
@@ -376,62 +378,28 @@ class PrefillAdder:
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         running_batch: ScheduleBatch,
         new_token_ratio: float,
-        rem_input_tokens: int,
-        rem_chunk_tokens: Optional[int],
-        mixed_with_decode_tokens: int = 0,
-        priority_scheduling_preemption_threshold: int = 0,
-        prefill_max_requests: Optional[int] = None,
-        prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
-        self.rem_input_tokens = rem_input_tokens - mixed_with_decode_tokens
-        self.rem_chunk_tokens = rem_chunk_tokens
 
-        if self.rem_chunk_tokens is not None:
-            self.rem_chunk_tokens -= mixed_with_decode_tokens
-        self.rem_total_token_offset = mixed_with_decode_tokens
-        self.cur_rem_token_offset = mixed_with_decode_tokens
+        self.rem_total_token_offset = 0
+        self.cur_rem_token_offset = 0
 
-        self.req_states = None
-        self.can_run_list = []
-        self.preempt_list = []
-        self.new_chunked_req = None
+        self.can_run_list: List[Req] = []
         self.log_hit_tokens = 0
-        # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
-
-        if running_batch is not None:
-            self.rem_total_token_offset += sum(
-                [
-                    self._get_running_request_total_token_offset(r)
-                    for r in running_batch.reqs
-                ]
-            )
 
         self.is_hybrid_swa = isinstance(
             self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
         )
+
         self.is_hybrid_ssm_cache = self.tree_cache.supports_mamba()
 
-        self.priority_scheduling_preemption_threshold = (
-            priority_scheduling_preemption_threshold
-        )
-        self.nsa_prefill_cp_in_seq_split = is_nsa_prefill_cp_in_seq_split()
-        self.prefill_max_requests = prefill_max_requests
-        self.prefill_delayer_single_pass = prefill_delayer_single_pass
-
-    def _get_running_request_total_token_offset(self, req: Req) -> int:
-        return (
-            min(
-                (req.sampling_params.max_new_tokens - len(req.output_ids)),
-                CLIP_MAX_NEW_TOKENS,
-            )
-            * self.new_token_ratio
-        )
+    def ceil_paged_tokens(self, tokens: int) -> int:
+        return -(-tokens // self.page_size) * self.page_size
 
     @property
     def rem_total_tokens(self):
@@ -473,15 +441,103 @@ class PrefillAdder:
                 self.token_to_kv_pool_allocator.available_size()
                 + self.tree_cache.evictable_size()
             )
-
         return available_and_evictable - self.cur_rem_token_offset
-
-    def ceil_paged_tokens(self, tokens: int) -> int:
-        return -(-tokens // self.page_size) * self.page_size
 
     def budget_state(self):
         if self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0:
             return AddReqResult.NO_TOKEN
+        return AddReqResult.CONTINUE
+
+    def update_budget(self, extend_input_len: int, max_new_tokens: int = 0):
+        extend_input_len = self.ceil_paged_tokens(extend_input_len)
+        self.rem_total_token_offset += extend_input_len + max_new_tokens
+        self.cur_rem_token_offset += extend_input_len
+
+    def _get_running_request_total_token_offset(self, req: Req) -> int:
+        return (
+            min(
+                (req.sampling_params.max_new_tokens - len(req.output_ids)),
+                CLIP_MAX_NEW_TOKENS,
+            )
+            * self.new_token_ratio
+        )
+
+    @contextmanager
+    def _lock_node(self, last_node):
+        try:
+            if self.is_hybrid_swa and self.tree_cache.is_tree_cache():
+                swa_uuid_for_lock = self.tree_cache.inc_lock_ref(last_node)
+            else:
+                self.tree_cache.inc_lock_ref(last_node)
+            yield None
+        finally:
+            if self.is_hybrid_swa and self.tree_cache.is_tree_cache():
+                self.tree_cache.dec_lock_ref(last_node, swa_uuid_for_lock)
+            else:
+                self.tree_cache.dec_lock_ref(last_node)
+
+    def _req_inc_lock_ref(self, req: Req):
+        if self.is_hybrid_swa:
+            swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
+            req.swa_uuid_for_lock = swa_uuid_for_lock
+        else:
+            self.tree_cache.inc_lock_ref(req.last_node)
+
+
+class PrefillAdder(PrefillAdderBase):
+    def __init__(
+        self,
+        page_size: int,
+        tree_cache: BasePrefixCache,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+        running_batch: ScheduleBatch,
+        new_token_ratio: float,
+        rem_input_tokens: int,
+        rem_chunk_tokens: Optional[int],
+        mixed_with_decode_tokens: int = 0,
+        priority_scheduling_preemption_threshold: int = 0,
+        prefill_max_requests: Optional[int] = None,
+        prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
+    ):
+        super().__init__(
+            page_size=page_size,
+            tree_cache=tree_cache,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            running_batch=running_batch,
+            new_token_ratio=new_token_ratio,
+        )
+
+        self.rem_input_tokens = rem_input_tokens - mixed_with_decode_tokens
+        self.rem_chunk_tokens = rem_chunk_tokens
+
+        if self.rem_chunk_tokens is not None:
+            self.rem_chunk_tokens -= mixed_with_decode_tokens
+        self.rem_total_token_offset = mixed_with_decode_tokens
+        self.cur_rem_token_offset = mixed_with_decode_tokens
+
+        self.req_states = None
+        self.preempt_list = []
+        self.new_chunked_req = None
+
+        if running_batch is not None:
+            self.rem_total_token_offset += sum(
+                [
+                    self._get_running_request_total_token_offset(r)
+                    for r in running_batch.reqs
+                ]
+            )
+
+        self.priority_scheduling_preemption_threshold = (
+            priority_scheduling_preemption_threshold
+        )
+        self.nsa_prefill_cp_in_seq_split = is_nsa_prefill_cp_in_seq_split()
+        self.prefill_max_requests = prefill_max_requests
+        self.prefill_delayer_single_pass = prefill_delayer_single_pass
+
+    def budget_state(self):
+        base_state = super().budget_state()
+        if base_state != AddReqResult.CONTINUE:
+            return base_state
 
         if self.rem_input_tokens <= 0:
             return AddReqResult.OTHER
@@ -495,24 +551,15 @@ class PrefillAdder:
         self, prefix_len: int, extend_input_len: int, max_new_tokens: int
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
-        extend_input_len = self.ceil_paged_tokens(extend_input_len)
+        self.update_budget(extend_input_len, max_new_tokens)
 
-        self.rem_total_token_offset += extend_input_len + max_new_tokens
-        self.cur_rem_token_offset += extend_input_len
-        self.rem_input_tokens -= extend_input_len
+        self.rem_input_tokens -= self.ceil_paged_tokens(extend_input_len)
 
         if self.rem_chunk_tokens is not None:
             self.rem_chunk_tokens -= extend_input_len
 
         self.log_hit_tokens += prefix_len
         self.log_input_tokens += extend_input_len
-
-    def _req_inc_lock_ref(self, req: Req):
-        if self.is_hybrid_swa:
-            swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
-            req.swa_uuid_for_lock = swa_uuid_for_lock
-        else:
-            self.tree_cache.inc_lock_ref(req.last_node)
 
     def add_chunked_req(self, req: Req):
         _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
@@ -537,20 +584,6 @@ class PrefillAdder:
 
         # Return if chunked prefill not finished
         return req if truncated else None
-
-    @contextmanager
-    def _lock_node(self, last_node: TreeNode):
-        try:
-            if self.tree_cache.supports_swa() and self.tree_cache.is_tree_cache():
-                swa_uuid_for_lock = self.tree_cache.inc_lock_ref(last_node)
-            else:
-                self.tree_cache.inc_lock_ref(last_node)
-            yield None
-        finally:
-            if self.tree_cache.supports_swa() and self.tree_cache.is_tree_cache():
-                self.tree_cache.dec_lock_ref(last_node, swa_uuid_for_lock)
-            else:
-                self.tree_cache.dec_lock_ref(last_node)
 
     def add_one_req_ignore_eos(self, req: Req):
         # Early exit if no enough tokens for the input tokens

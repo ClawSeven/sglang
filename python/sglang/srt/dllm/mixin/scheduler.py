@@ -1,20 +1,20 @@
 from __future__ import annotations
 
 import logging
-from contextlib import contextmanager
 from typing import TYPE_CHECKING, List, Optional, Set, Union
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-from sglang.srt.managers.schedule_policy import AddReqResult
-from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
+from sglang.srt.managers.schedule_policy import (
+    CLIP_MAX_NEW_TOKENS,
+    IGNORE_EOS_RESERVE_TOKENS,
+    AddReqResult,
+    PrefillAdderBase,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
 
 logger = logging.getLogger(__name__)
-
-CLIP_MAX_NEW_TOKENS = 4096
-IGNORE_EOS_RESERVE_TOKENS = 1
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
 
-class DllmPrefillAdder:
+class DllmPrefillAdder(PrefillAdderBase):
     """
     Prefill adder for Diffusion LLM (DLLM) scheduling.
 
@@ -43,24 +43,20 @@ class DllmPrefillAdder:
         rem_input_tokens: int,
         dllm_config: Optional[DllmConfig] = None,
     ):
-        self.page_size = page_size
-        self.tree_cache = tree_cache
-        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        self.running_batch = running_batch
-        self.new_token_ratio = new_token_ratio
+        super().__init__(
+            page_size=page_size,
+            tree_cache=tree_cache,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            running_batch=running_batch,
+            new_token_ratio=new_token_ratio,
+        )
+
         self.rem_input_tokens = rem_input_tokens
         self.dllm_config = dllm_config
 
         # Initialize DLLM-specific metadata
         if self.dllm_config is not None:
             self._init_dllm_meta(dllm_config)
-
-        self.rem_total_token_offset = 0
-        self.cur_rem_token_offset = 0
-
-        self.can_run_list: List[Req] = []
-        self.log_hit_tokens = 0
-        self.log_input_tokens = 0
 
         # For ignore_eos support: track token states of all requests
         self.req_states: Optional[List[tuple]] = None
@@ -73,59 +69,10 @@ class DllmPrefillAdder:
                 ]
             )
 
-        # SWA support
-        self.is_hybrid_swa = isinstance(
-            self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
-        )
-
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
         max_running_reqs = dllm_config.max_running_requests
         self.rem_dllm_tokens = max_running_reqs * self.dllm_block_size
-
-    def _get_running_request_total_token_offset(self, req: Req) -> int:
-        return (
-            min(
-                (req.sampling_params.max_new_tokens - len(req.output_ids)),
-                CLIP_MAX_NEW_TOKENS,
-            )
-            * self.new_token_ratio
-        )
-
-    @property
-    def rem_total_tokens(self):
-        if self.is_hybrid_swa:
-            available_and_evictable = min(
-                self.token_to_kv_pool_allocator.full_available_size()
-                + self.tree_cache.full_evictable_size(),
-                self.token_to_kv_pool_allocator.swa_available_size()
-                + self.tree_cache.swa_evictable_size(),
-            )
-        else:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.evictable_size()
-            )
-        return available_and_evictable - self.rem_total_token_offset
-
-    @property
-    def cur_rem_tokens(self):
-        if self.is_hybrid_swa:
-            available_and_evictable = min(
-                self.token_to_kv_pool_allocator.full_available_size()
-                + self.tree_cache.full_evictable_size(),
-                self.token_to_kv_pool_allocator.swa_available_size()
-                + self.tree_cache.swa_evictable_size(),
-            )
-        else:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.evictable_size()
-            )
-        return available_and_evictable - self.cur_rem_token_offset
-
-    def ceil_paged_tokens(self, tokens: int) -> int:
-        return -(-tokens // self.page_size) * self.page_size
 
     def budget_state(self):
         if self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0:
@@ -180,32 +127,8 @@ class DllmPrefillAdder:
 
         self._update_prefill_budget(prefix_len, trunc_len, 0)
 
-    def _req_inc_lock_ref(self, req: Req):
-        if self.is_hybrid_swa:
-            swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
-            req.swa_uuid_for_lock = swa_uuid_for_lock
-        else:
-            self.tree_cache.inc_lock_ref(req.last_node)
-
-    @contextmanager
-    def _lock_node(self, last_node):
-        try:
-            if self.is_hybrid_swa and self.tree_cache.is_tree_cache():
-                swa_uuid_for_lock = self.tree_cache.inc_lock_ref(last_node)
-            else:
-                self.tree_cache.inc_lock_ref(last_node)
-            yield None
-        finally:
-            if self.is_hybrid_swa and self.tree_cache.is_tree_cache():
-                self.tree_cache.dec_lock_ref(last_node, swa_uuid_for_lock)
-            else:
-                self.tree_cache.dec_lock_ref(last_node)
-
     def add_req(self, req: Req):
         """
-        Add one DLLM request (either incoming or staging).
-
-        Uses req.is_incoming to differentiate behavior:
         - Incoming requests: Need full validation, locking, and initialization
         - Staging requests: Already have resources allocated, skip locking
         """
@@ -217,7 +140,6 @@ class DllmPrefillAdder:
         return self._add_incoming_req(req)
 
     def _add_staging_req(self, req: Req) -> AddReqResult:
-        """Handle staging request - resources already allocated."""
         assert self.dllm_config is not None
         _rem_tokens = self._get_dllm_remain_tokens()
 
@@ -246,7 +168,6 @@ class DllmPrefillAdder:
         )
 
     def _add_incoming_req(self, req: Req) -> AddReqResult:
-        """Handle incoming request - needs full validation and locking."""
         # Handle ignore_eos case when tree cache is disabled
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)

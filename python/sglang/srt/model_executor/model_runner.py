@@ -276,6 +276,7 @@ class ModelRunnerOutput:
     logits_output: Union[LogitsProcessorOutput, PPProxyTensors]
     can_run_graph: bool
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
+    dllm_post_processed: bool = False
 
 
 class ModelRunner(ModelRunnerKVCacheMixin):
@@ -2474,7 +2475,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
-            return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+            dllm_post_processed = getattr(
+                self.graph_runner, "dllm_fuse_post_process", False
+            )
+            return ModelRunnerOutput(
+                logits_output=ret,
+                can_run_graph=can_run_graph,
+                dllm_post_processed=dllm_post_processed,
+            )
 
         # For MLP sync
         if forward_batch.global_num_tokens_cpu is not None:

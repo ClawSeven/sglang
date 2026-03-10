@@ -41,6 +41,16 @@ from sglang.srt.distributed.parallel_state import (
     set_pdmux_status,
 )
 from sglang.srt.dllm.config import DllmConfig
+
+try:
+    from sglang.srt.dllm.kernels.low_confidence_utils import (
+        calculate_low_confidence_score,
+    )
+
+    _DLLM_TRITON_AVAILABLE = True
+except ImportError:
+    _DLLM_TRITON_AVAILABLE = False
+
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -74,6 +84,7 @@ from sglang.srt.utils import (
     require_gathered_buffer,
     require_mlp_sync,
     require_mlp_tp_gather,
+    support_triton,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -501,6 +512,20 @@ class CudaGraphRunner:
 
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm = self.dllm_config is not None
+
+        # DLLM fused post-process: capture triton kernel in cuda graph
+        self.dllm_fuse_post_process = False
+        if self.is_dllm and _DLLM_TRITON_AVAILABLE:
+            attn_backend = model_runner.server_args.attention_backend
+            disable_fused = self.dllm_config.algorithm_config.get(
+                "disable_fused_triton_algorithm", False
+            )
+            if not disable_fused and support_triton(attn_backend):
+                self.dllm_fuse_post_process = True
+                self.dllm_mask_id = self.dllm_config.mask_id
+                self.dllm_threshold = self.dllm_config.algorithm_config.get(
+                    "threshold", 0.95
+                )
 
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
@@ -952,6 +977,25 @@ class CudaGraphRunner:
                 forward_batch,
                 **kwargs,
             )
+
+            # Fuse DLLM post-process into the cuda graph
+            if self.dllm_fuse_post_process and isinstance(
+                logits_output_or_pp_proxy_tensors, LogitsProcessorOutput
+            ):
+                full_logits = logits_output_or_pp_proxy_tensors.full_logits
+                if full_logits is not None:
+                    block_size = self.dllm_config.block_size
+                    for batch_id in range(bs):
+                        start = batch_id * block_size
+                        end = start + block_size
+                        calculate_low_confidence_score(
+                            full_logits[start:end],
+                            input_ids[start:end],
+                            self.dllm_mask_id,
+                            self.dllm_threshold,
+                            autotune=False,
+                        )
+
             return logits_output_or_pp_proxy_tensors
 
         self.deepep_adapter.capture(is_extend_in_batch=False)
@@ -1095,6 +1139,10 @@ class CudaGraphRunner:
             graph_key = self.bs
         self.graphs[graph_key].replay()
         output = self.output_buffers[graph_key]
+
+        # Copy back modified input_ids when DLLM post-process was fused in graph
+        if self.dllm_fuse_post_process:
+            forward_batch.input_ids.copy_(self.buffers.input_ids[: self.raw_num_token])
 
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
